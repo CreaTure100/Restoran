@@ -23,7 +23,7 @@ const initialOrders = [
     dishes: [
       { name: 'Капрезе', total: 2, remaining: 2, dishId: 2, comment: '', status: 'pending' },
       { name: 'Пицца Маргарита', total: 1, remaining: 1, dishId: 5, comment: '', status: 'pending' },
-      { name: 'Джелато', total: 2, remaining: 2, dishId: 17, comment: '', status: 'pending' },
+      { name: 'Сабайон', total: 2, remaining: 2, dishId: 17, comment: '', status: 'pending' },
     ],
     completed: false,
     createdAt: new Date().toISOString(),
@@ -107,7 +107,7 @@ const initialOrders = [
     dishes: [
       { name: 'Ризотто с грибами', total: 2, remaining: 2, dishId: 14, comment: '', status: 'pending' },
       { name: 'Тортиллини с грибами', total: 1, remaining: 1, dishId: 12, comment: '', status: 'pending' },
-      { name: 'Джелато', total: 2, remaining: 2, dishId: 17, comment: '', status: 'pending' },
+      { name: 'Сабайон', total: 2, remaining: 2, dishId: 17, comment: '', status: 'pending' },
     ],
     completed: false,
     createdAt: new Date().toISOString(),
