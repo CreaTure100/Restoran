@@ -1,773 +1,994 @@
+const path = require('path');
 const express = require('express');
 const cors = require('cors');
 const { nanoid } = require('nanoid');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
-const { initialUsers } = require('./data/users');
-const { initialMenuItems } = require('./data/menu');
-const { initialTables } = require('./data/tables');
-const { initialOrders } = require('./data/orders');
-
-const app = express();
-const port = 3001;
-
-app.use(cors());
-app.use(express.json());
-app.use(express.urlencoded({ extended: false }));
-app.use('/images', express.static('public/images'));
+const pool = require('./db/pool');
+const config = require('./config');
+const { migrate } = require('./db/migrate');
+const { seedDatabase } = require('./db/seed');
+const { parseTimeSlot, toBookingDates } = require('./utils/time');
+const { normalizeEmail, validateEmail, validatePassword } = require('./utils/validators');
+const { calculateOrderTotal, isOrderCompleted } = require('./utils/orders');
 
 const ROLES = {
-    GUEST: 'guest',
-    CLIENT: 'client',
-    WAITER: 'waiter',
-    CHEF: 'chef',
-    ADMIN: 'admin'
+  CLIENT: 'client',
+  WAITER: 'waiter',
+  CHEF: 'chef',
+  ADMIN: 'admin',
 };
 
-const JWT_SECRET = "TableOne_access_secret_key";
-const REFRESH_SECRET = "Table_refresh_secret_key";
-const ACCESS_EXPIRES_IN = "45m";
-const REFRESH_EXPIRES_IN = "1d";
-
-let refreshTokens = [];
-let users = [...initialUsers];
-let menuItems = [...initialMenuItems];
-let tables = [...initialTables];
-let orders = [...initialOrders];
-let dishQueue = [];
-
-function parseTimeSlot(slot) {
-    if (!slot) return null;
-    
-    let cleanSlot = slot;
-    if (cleanSlot.includes('с ') && cleanSlot.includes(' до')) {
-        cleanSlot = cleanSlot.replace('с ', '').replace(' до', '-');
-    }
-    
-    const [start, end] = cleanSlot.split('-');
-    if (!start || !end) return null;
-    
-    const [startHour, startMin] = start.trim().split(':').map(Number);
-    const [endHour, endMin] = end.trim().split(':').map(Number);
-    
-    if (isNaN(startHour) || isNaN(endHour)) return null;
-    
-    return {
-        start: startHour * 60 + (startMin || 0),
-        end: endHour * 60 + (endMin || 0),
-        startStr: start.trim(),
-        endStr: end.trim()
-    };
-}
-
-function updateDishQueue() {
-    dishQueue = [];
-    const activeOrders = orders.filter(o => !o.completed);
-    
-    activeOrders.forEach(order => {
-        order.dishes.forEach((dish, idx) => {
-            if (dish.remaining > 0) {
-                const status = dish.status || 'pending';
-                dishQueue.push({
-                    id: `${order.id}-${idx}`,
-                    orderId: order.id,
-                    tableId: order.tableId,
-                    dishName: dish.name,
-                    dishId: dish.dishId,
-                    quantity: dish.remaining,
-                    comment: dish.comment || '',
-                    status: status,
-                    timeSlot: order.timeSlot
-                });
-            }
-        });
-    });
-}
-
-updateDishQueue();
-
 async function hashPassword(password) {
-    return bcrypt.hash(password, 10);
+  return bcrypt.hash(password, 10);
 }
 
 async function verifyPassword(password, passwordHash) {
-    return bcrypt.compare(password, passwordHash);
+  return bcrypt.compare(password, passwordHash);
 }
 
 function generateTokens(user) {
-    const accessToken = jwt.sign(
-        {
-            id: user.id,
-            email: user.email,
-            name: user.name,
-            role: user.role
-        },
-        JWT_SECRET,
-        { expiresIn: ACCESS_EXPIRES_IN }
-    );
-    
-    const refreshToken = jwt.sign(
-        { id: user.id },
-        REFRESH_SECRET,
-        { expiresIn: REFRESH_EXPIRES_IN }
-    );
-    refreshTokens = refreshTokens.filter(rt => rt.userId !== user.id); // Удаление старых токенов пользователя
-    refreshTokens.push({
-        token: refreshToken,
-        userId: user.id,
-    });
-    
-    return { accessToken, refreshToken };
+  const accessToken = jwt.sign(
+    {
+      id: user.id,
+      email: user.email,
+      name: user.name,
+      role: user.role,
+    },
+    config.jwtSecret,
+    { expiresIn: config.accessExpiresIn },
+  );
+
+  const refreshToken = jwt.sign(
+    { id: user.id },
+    config.refreshSecret,
+    { expiresIn: config.refreshExpiresIn },
+  );
+
+  return { accessToken, refreshToken };
+}
+
+async function storeRefreshToken(token, userId) {
+  await pool.query('DELETE FROM refresh_tokens WHERE user_id = $1 OR expires_at < NOW()', [userId]);
+  await pool.query(
+    'INSERT INTO refresh_tokens (token, user_id, expires_at) VALUES ($1, $2, NOW() + $3::interval)',
+    [token, userId, config.refreshExpiresIn],
+  );
 }
 
 function authenticateToken(req, res, next) {
-    const authHeader = req.headers['authorization'];
-    const token = authHeader && authHeader.split(' ')[1];
-    
-    if (!token) {
-        return res.status(401).json({ error: "Токен не предоставлен" });
-    }
-    
-    jwt.verify(token, JWT_SECRET, (err, user) => {
-        if (err) {
-            return res.status(403).json({ error: "Недействительный или просроченный токен" });
-        }
-        req.user = user;
-        next();
-    });
+  const authHeader = req.headers.authorization;
+  const token = authHeader && authHeader.split(' ')[1];
+
+  if (!token) return res.status(401).json({ error: 'Токен не предоставлен' });
+
+  try {
+    req.user = jwt.verify(token, config.jwtSecret);
+    return next();
+  } catch {
+    return res.status(403).json({ error: 'Недействительный или просроченный токен' });
+  }
+}
+
+function optionalAuth(req, _res, next) {
+  const authHeader = req.headers.authorization;
+  const token = authHeader && authHeader.split(' ')[1];
+
+  if (!token) {
+    req.user = null;
+    return next();
+  }
+
+  try {
+    req.user = jwt.verify(token, config.jwtSecret);
+  } catch {
+    req.user = null;
+  }
+
+  return next();
 }
 
 function authorize(...allowedRoles) {
-    return (req, res, next) => {
-        if (!req.user) {
-            return res.status(401).json({ error: "Требуется аутентификация" });
-        }
-        
-        const user = users.find(u => u.id === req.user.id);
-        
-        if (!user) {
-            return res.status(404).json({ error: "Пользователь не найден" });
-        }
-        
-        if (user.isBlocked) {
-            return res.status(403).json({ error: "Пользователь заблокирован" });
-        }
-        
-        if (!allowedRoles.includes(user.role)) {
-            return res.status(403).json({ 
-                error: "Недостаточно прав для выполнения операции",
-                requiredRoles: allowedRoles,
-                userRole: user.role
-            });
-        }
-        
-        next();
-    };
+  return async (req, res, next) => {
+    if (!req.user) return res.status(401).json({ error: 'Требуется аутентификация' });
+
+    const userResult = await pool.query('SELECT id, role, is_blocked FROM users WHERE id = $1', [req.user.id]);
+    const user = userResult.rows[0];
+
+    if (!user) return res.status(404).json({ error: 'Пользователь не найден' });
+    if (user.is_blocked) return res.status(403).json({ error: 'Пользователь заблокирован' });
+    if (!allowedRoles.includes(user.role)) {
+      return res.status(403).json({
+        error: 'Недостаточно прав для выполнения операции',
+        requiredRoles: allowedRoles,
+        userRole: user.role,
+      });
+    }
+
+    req.user.role = user.role;
+    return next();
+  };
 }
 
-function validateEmail(email){
-    const emailRegex= /^[^\s@]+@([^\s@]+\.)+[^\s@]+$/;
-    if (!email){
-        return  "Email обязателен";
-    }
-    if (!emailRegex.test(email)){
-        return "Некорректный email ";
-    }
-    return null;
+function validateBookingTime(slot) {
+  const parsed = parseTimeSlot(slot);
+  if (!parsed) return 'Неверный формат времени. Используйте HH:MM-HH:MM';
+  if (parsed.end <= parsed.start) return 'Время окончания должно быть позже времени начала';
+  if (parsed.end - parsed.start < 30) return 'Минимальное время бронирования 30 минут';
+  if (parsed.start < 9 * 60 || parsed.end > 23 * 60) return 'Ресторан работает с 9:00 до 23:00';
+  return null;
 }
 
-function validatePassword(password){
-    if (!password){
-        return "Пароль обязателен";
-    }
-    if (password.length < 6){
-        return "Пароль должен состоять минимум из 6 символов";
-    }
-    return null;
+async function getTablesWithSlots() {
+  const { rows } = await pool.query(
+    `SELECT t.id,
+            b.time_slot,
+            b.booking_start
+     FROM restaurant_tables t
+     LEFT JOIN bookings b ON b.table_id = t.id AND b.status = 'active'
+     ORDER BY t.id, b.booking_start`,
+  );
+
+  const tableMap = new Map();
+
+  for (const row of rows) {
+    if (!tableMap.has(row.id)) tableMap.set(row.id, { id: row.id, slots: [] });
+    if (row.time_slot) tableMap.get(row.id).slots.push(row.time_slot);
+  }
+
+  return [...tableMap.values()].map((table) => {
+    const hasFullDay = table.slots.some((slot) => slot === '09:00-23:00');
+    const status = table.slots.length === 0 ? 'free' : (hasFullDay || table.slots.length >= 3 ? 'booked' : 'partial');
+    return { ...table, status };
+  });
 }
 
-app.post('/api/auth/register', async (req, res) => {
+async function fetchOrders() {
+  const result = await pool.query(
+    `SELECT o.id,
+            o.table_id,
+            o.time_slot,
+            o.sort_minutes,
+            o.completed,
+            o.client_id,
+            o.client_name,
+            o.status,
+            o.created_at,
+            oi.id AS item_id,
+            oi.dish_id,
+            oi.dish_name,
+            oi.total,
+            oi.remaining,
+            oi.comment,
+            oi.status AS item_status
+     FROM orders o
+     LEFT JOIN order_items oi ON oi.order_id = o.id
+     ORDER BY o.sort_minutes, o.created_at, oi.id`,
+  );
+
+  const orderMap = new Map();
+
+  for (const row of result.rows) {
+    if (!orderMap.has(row.id)) {
+      orderMap.set(row.id, {
+        id: row.id,
+        tableId: row.table_id,
+        timeSlot: row.time_slot,
+        sortMinutes: row.sort_minutes,
+        completed: row.completed,
+        createdAt: row.created_at,
+        clientId: row.client_id,
+        clientName: row.client_name,
+        status: row.status,
+        dishes: [],
+      });
+    }
+
+    if (row.item_id) {
+      orderMap.get(row.id).dishes.push({
+        itemId: row.item_id,
+        name: row.dish_name,
+        total: row.total,
+        remaining: row.remaining,
+        dishId: row.dish_id,
+        comment: row.comment,
+        status: row.item_status,
+      });
+    }
+  }
+
+  return [...orderMap.values()];
+}
+
+function createApp() {
+  const app = express();
+
+  app.use(cors());
+  app.use(express.json());
+  app.use(express.urlencoded({ extended: false }));
+  app.use('/images', express.static(path.join(__dirname, 'public/images')));
+
+  app.get('/health', async (_req, res) => {
+    await pool.query('SELECT 1');
+    res.status(200).json({ status: 'ok' });
+  });
+
+  app.post('/api/auth/register', async (req, res) => {
     const { name, email, password } = req.body;
+
+    if (!name || !email || !password) {
+      return res.status(400).json({ error: 'Имя, email и пароль обязательны' });
+    }
+
     const emailError = validateEmail(email);
     const passwordError = validatePassword(password);
-    
-    if (!name || !email || !password) {
-        return res.status(400).json({ error: "Имя, email и пароль обязательны" });
+    if (emailError) return res.status(400).json({ error: emailError });
+    if (passwordError) return res.status(400).json({ error: passwordError });
+
+    const normalizedEmail = normalizeEmail(email);
+
+    try {
+      const created = await pool.query(
+        `INSERT INTO users (id, name, email, password, role, is_blocked)
+         VALUES ($1, $2, $3, $4, $5, FALSE)
+         RETURNING id, name, email, role, is_blocked AS "isBlocked", created_at AS "createdAt"`,
+        [nanoid(), name, normalizedEmail, await hashPassword(password), ROLES.CLIENT],
+      );
+
+      return res.status(201).json(created.rows[0]);
+    } catch (error) {
+      if (error.code === '23505') {
+        return res.status(409).json({ error: 'Пользователь с таким email уже существует' });
+      }
+      throw error;
     }
+  });
 
-    if (emailError){
-        return res.status(400).json({error: emailError});
-    }
-
-    if (passwordError){
-        return res.status(400).json({error: passwordError});
-    }
-
-    const existingUser = users.find(u => u.email === email);
-    if (existingUser) {
-        return res.status(409).json({ error: "Пользователь с таким email уже существует" });
-    }
-
-    const newUser = {
-        id: nanoid(),
-        name,
-        email: email.toLowerCase().trim(), //Добавил нормализцацию, чтобы избежать возможных ошибок
-        password: await hashPassword(password),
-        role: ROLES.CLIENT,
-        isBlocked: false,
-        createdAt: new Date().toISOString()
-    };
-    
-    users.push(newUser);
-    
-    const userResponse = { ...newUser };
-    delete userResponse.password;
-    
-    res.status(201).json(userResponse);
-});
-
-app.post('/api/auth/login', async (req, res) => {
+  app.post('/api/auth/login', async (req, res) => {
     const { email, password } = req.body;
-    
-    if (!email || !password) {
-        return res.status(400).json({ error: "Email и пароль обязательны" });
-    }
-    
-    const user = users.find(u => u.email === email);
-    if (!user) {
-        return res.status(404).json({ error: "Пользователь не найден" });
-    }
-    
-    if (user.isBlocked) {
-        return res.status(401).json({ error: "Пользователь заблокирован" });
-    }
+    if (!email || !password) return res.status(400).json({ error: 'Email и пароль обязательны' });
 
-    const isPasswordValid = await verifyPassword(password, user.password);
-    
-    if (isPasswordValid) {
-        const tokens = generateTokens(user);
-        const userResponse = { ...user };
-        delete userResponse.password;
-        
-        res.status(200).json({
-            accessToken: tokens.accessToken,
-            refreshToken: tokens.refreshToken,
-            user: userResponse
-        });
-    } else {
-        res.status(401).json({ error: "Неверный пароль" });
-    }
-});
+    const normalizedEmail = normalizeEmail(email);
+    const userResult = await pool.query(
+      `SELECT id, name, email, password, role, is_blocked, created_at
+       FROM users
+       WHERE email = $1`,
+      [normalizedEmail],
+    );
 
-app.post('/api/auth/refresh', (req, res) => {
-    const { refreshToken } = req.body;
-    
-    if (!refreshToken) {
-        return res.status(400).json({ error: "Refresh токен не предоставлен" });
-    }
-    
-    const storedToken = refreshTokens.find(rt => rt.token === refreshToken);
-    if (!storedToken) {
-        return res.status(401).json({ error: "Недействительный refresh токен" });
-    }
-    
-    jwt.verify(refreshToken, REFRESH_SECRET, (err, decoded) => {
-        if (err) {
-            refreshTokens = refreshTokens.filter(rt => rt.token !== refreshToken);
-            return res.status(403).json({ error: "Refresh токен истек" });
-        }
-        
-        const user = users.find(u => u.id === decoded.id);
-        if (!user || user.isBlocked) {
-            refreshTokens = refreshTokens.filter(rt => rt.token !== refreshToken);
-            return res.status(401).json({ error: "Пользователь не найден или заблокирован" });
-        }
-        
-        refreshTokens = refreshTokens.filter(rt => rt.token !== refreshToken);
-        const tokens = generateTokens(user);
-        res.status(200).json(tokens);
+    const user = userResult.rows[0];
+
+    if (!user) return res.status(404).json({ error: 'Пользователь не найден' });
+    if (user.is_blocked) return res.status(401).json({ error: 'Пользователь заблокирован' });
+
+    const validPassword = await verifyPassword(password, user.password);
+    if (!validPassword) return res.status(401).json({ error: 'Неверный пароль' });
+
+    const tokens = generateTokens(user);
+    await storeRefreshToken(tokens.refreshToken, user.id);
+
+    return res.status(200).json({
+      ...tokens,
+      user: {
+        id: user.id,
+        name: user.name,
+        email: user.email,
+        role: user.role,
+        isBlocked: user.is_blocked,
+        createdAt: user.created_at,
+      },
     });
-});
+  });
 
-app.get('/api/auth/me', authenticateToken, (req, res) => {
-    const user = users.find(u => u.id === req.user.id);
-    if (!user) {
-        return res.status(404).json({ error: "Пользователь не найден" });
+  app.post('/api/auth/refresh', async (req, res) => {
+    const { refreshToken } = req.body;
+    if (!refreshToken) return res.status(400).json({ error: 'Refresh токен не предоставлен' });
+
+    const tokenResult = await pool.query(
+      'SELECT token, user_id FROM refresh_tokens WHERE token = $1 AND expires_at > NOW()',
+      [refreshToken],
+    );
+
+    if (!tokenResult.rows[0]) {
+      return res.status(401).json({ error: 'Недействительный refresh токен' });
     }
-    
-    const userResponse = { ...user };
-    delete userResponse.password;
-    
-    res.status(200).json(userResponse);
-});
 
-app.post('/api/auth/logout', authenticateToken, (req, res) => {
+    let decoded;
+    try {
+      decoded = jwt.verify(refreshToken, config.refreshSecret);
+    } catch {
+      await pool.query('DELETE FROM refresh_tokens WHERE token = $1', [refreshToken]);
+      return res.status(403).json({ error: 'Refresh токен истек' });
+    }
+
+    const userResult = await pool.query(
+      `SELECT id, name, email, role, is_blocked
+       FROM users
+       WHERE id = $1`,
+      [decoded.id],
+    );
+
+    const user = userResult.rows[0];
+    if (!user || user.is_blocked) {
+      await pool.query('DELETE FROM refresh_tokens WHERE token = $1', [refreshToken]);
+      return res.status(401).json({ error: 'Пользователь не найден или заблокирован' });
+    }
+
+    await pool.query('DELETE FROM refresh_tokens WHERE token = $1', [refreshToken]);
+
+    const tokens = generateTokens(user);
+    await storeRefreshToken(tokens.refreshToken, user.id);
+
+    return res.status(200).json(tokens);
+  });
+
+  app.get('/api/auth/me', authenticateToken, async (req, res) => {
+    const userResult = await pool.query(
+      `SELECT id, name, email, role, is_blocked AS "isBlocked", created_at AS "createdAt"
+       FROM users
+       WHERE id = $1`,
+      [req.user.id],
+    );
+
+    const user = userResult.rows[0];
+    if (!user) return res.status(404).json({ error: 'Пользователь не найден' });
+
+    return res.status(200).json(user);
+  });
+
+  app.post('/api/auth/logout', authenticateToken, async (req, res) => {
     const { refreshToken } = req.body;
     if (refreshToken) {
-        refreshTokens = refreshTokens.filter(rt => rt.token !== refreshToken);
+      await pool.query('DELETE FROM refresh_tokens WHERE token = $1', [refreshToken]);
     }
-    res.status(200).json({ message: "Выход выполнен успешно" });
-});
+    return res.status(200).json({ message: 'Выход выполнен успешно' });
+  });
 
-app.get('/api/users', authenticateToken, authorize(ROLES.ADMIN), (req, res) => {
-    const usersResponse = users.map(user => {
-        const { password, ...userWithoutPassword } = user;
-        return userWithoutPassword;
-    });
-    res.json(usersResponse);
-});
+  app.get('/api/users', authenticateToken, authorize(ROLES.ADMIN), async (_req, res) => {
+    const result = await pool.query(
+      `SELECT id, name, email, role, is_blocked AS "isBlocked", created_at AS "createdAt"
+       FROM users
+       ORDER BY created_at`,
+    );
+    res.json(result.rows);
+  });
 
-app.get('/api/users/:id', authenticateToken, authorize(ROLES.ADMIN), (req, res) => {
-    const user = users.find(u => u.id === req.params.id);
-    if (!user) {
-        return res.status(404).json({ error: 'Пользователь не найден' });
-    }
-    
-    const { password, ...userWithoutPassword } = user;
-    res.json(userWithoutPassword);
-});
+  app.get('/api/users/:id', authenticateToken, authorize(ROLES.ADMIN), async (req, res) => {
+    const result = await pool.query(
+      `SELECT id, name, email, role, is_blocked AS "isBlocked", created_at AS "createdAt"
+       FROM users
+       WHERE id = $1`,
+      [req.params.id],
+    );
 
-app.put('/api/users/:id', authenticateToken, authorize(ROLES.ADMIN), (req, res) => {
-    const userIndex = users.findIndex(u => u.id === req.params.id);
-    if (userIndex === -1) {
-        return res.status(404).json({ error: 'Пользователь не найден' });
-    }
-    
+    if (!result.rows[0]) return res.status(404).json({ error: 'Пользователь не найден' });
+    return res.json(result.rows[0]);
+  });
+
+  app.put('/api/users/:id', authenticateToken, authorize(ROLES.ADMIN), async (req, res) => {
     const { name, email, role, isBlocked } = req.body;
-    
-    if (name) users[userIndex].name = name;
-    if (email) users[userIndex].email = email;
-    if (role && Object.values(ROLES).includes(role)) users[userIndex].role = role;
-    if (isBlocked !== undefined) users[userIndex].isBlocked = isBlocked;
-    
-    const { password, ...userWithoutPassword } = users[userIndex];
-    res.json(userWithoutPassword);
-});
 
-app.delete('/api/users/:id', authenticateToken, authorize(ROLES.ADMIN), (req, res) => {
-    const userIndex = users.findIndex(u => u.id === req.params.id);
-    if (userIndex === -1) {
-        return res.status(404).json({ error: 'Пользователь не найден' });
-    }
-    
-    if (users[userIndex].id === req.user.id) {
-        return res.status(400).json({ error: 'Нельзя заблокировать самого себя' });
-    }
-    
-    users[userIndex].isBlocked = true;
-    refreshTokens = refreshTokens.filter(rt => rt.userId !== req.params.id);
-    res.json({ message: 'Пользователь заблокирован' });
-});
+    const userResult = await pool.query('SELECT id FROM users WHERE id = $1', [req.params.id]);
+    if (!userResult.rows[0]) return res.status(404).json({ error: 'Пользователь не найден' });
 
-app.post('/api/users/employee', authenticateToken, authorize(ROLES.ADMIN), async (req, res) => {
+    const normalized = email ? normalizeEmail(email) : null;
+    if (normalized) {
+      const emailError = validateEmail(normalized);
+      if (emailError) return res.status(400).json({ error: emailError });
+    }
+
+    if (role && !Object.values(ROLES).includes(role)) {
+      return res.status(400).json({ error: 'Некорректная роль' });
+    }
+
+    try {
+      const result = await pool.query(
+        `UPDATE users
+         SET name = COALESCE($2, name),
+             email = COALESCE($3, email),
+             role = COALESCE($4, role),
+             is_blocked = COALESCE($5, is_blocked)
+         WHERE id = $1
+         RETURNING id, name, email, role, is_blocked AS "isBlocked", created_at AS "createdAt"`,
+        [req.params.id, name || null, normalized, role || null, isBlocked === undefined ? null : Boolean(isBlocked)],
+      );
+
+      return res.json(result.rows[0]);
+    } catch (error) {
+      if (error.code === '23505') {
+        return res.status(409).json({ error: 'Пользователь с таким email уже существует' });
+      }
+      throw error;
+    }
+  });
+
+  app.delete('/api/users/:id', authenticateToken, authorize(ROLES.ADMIN), async (req, res) => {
+    if (req.params.id === req.user.id) {
+      return res.status(400).json({ error: 'Нельзя заблокировать самого себя' });
+    }
+
+    const result = await pool.query(
+      `UPDATE users
+       SET is_blocked = TRUE
+       WHERE id = $1
+       RETURNING id`,
+      [req.params.id],
+    );
+
+    if (!result.rows[0]) return res.status(404).json({ error: 'Пользователь не найден' });
+
+    await pool.query('DELETE FROM refresh_tokens WHERE user_id = $1', [req.params.id]);
+    return res.json({ message: 'Пользователь заблокирован' });
+  });
+
+  app.post('/api/users/employee', authenticateToken, authorize(ROLES.ADMIN), async (req, res) => {
     const { name, email, password, role } = req.body;
+
+    if (!name || !email || !password || !role) {
+      return res.status(400).json({ error: 'Все поля обязательны' });
+    }
+
+    if (!Object.values(ROLES).includes(role)) {
+      return res.status(400).json({ error: 'Некорректная роль' });
+    }
+
     const emailError = validateEmail(email);
     const passwordError = validatePassword(password);
+    if (emailError) return res.status(400).json({ error: emailError });
+    if (passwordError) return res.status(400).json({ error: passwordError });
 
-    if (emailError){
-        return res.status(400).json({error: emailError});
+    try {
+      const created = await pool.query(
+        `INSERT INTO users (id, name, email, password, role, is_blocked)
+         VALUES ($1, $2, $3, $4, $5, FALSE)
+         RETURNING id, name, email, role, is_blocked AS "isBlocked", created_at AS "createdAt"`,
+        [nanoid(), name, normalizeEmail(email), await hashPassword(password), role],
+      );
+
+      return res.status(201).json(created.rows[0]);
+    } catch (error) {
+      if (error.code === '23505') {
+        return res.status(409).json({ error: 'Пользователь с таким email уже существует' });
+      }
+      throw error;
+    }
+  });
+
+  app.get('/api/menu', async (_req, res) => {
+    const result = await pool.query(
+      `SELECT id, name, price::float AS price, category, weight, description, image,
+              recipe, cooking_time AS "cookingTime", ingredients
+       FROM menu_items
+       ORDER BY id`,
+    );
+    res.json(result.rows);
+  });
+
+  app.get('/api/menu/:id', optionalAuth, async (req, res) => {
+    const result = await pool.query(
+      `SELECT id, name, price::float AS price, category, weight, description, image,
+              recipe, cooking_time AS "cookingTime", ingredients
+       FROM menu_items
+       WHERE id = $1`,
+      [Number(req.params.id)],
+    );
+
+    if (!result.rows[0]) return res.status(404).json({ error: 'Блюдо не найдено' });
+
+    const response = { ...result.rows[0] };
+    if (!req.user || ![ROLES.CHEF, ROLES.ADMIN].includes(req.user.role)) {
+      delete response.recipe;
     }
 
-    if (passwordError){
-        return res.status(400).json({error: passwordError})
-    }
-    
-    if (!name || !email || !password || !role) {
-        return res.status(400).json({ error: "Все поля обязательны" });
-    }
-    
-    if (!Object.values(ROLES).includes(role) || role === ROLES.GUEST) {
-        return res.status(400).json({ error: "Некорректная роль" });
-    }
-    
-    const existingUser = users.find(u => u.email === email);
-    if (existingUser) {
-        return res.status(409).json({ error: "Пользователь с таким email уже существует" });
-    }
-    
-    const newUser = {
-        id: nanoid(),
-        name,
-        email: email.toLowerCase().trim(), //Добавил нормализцацию, чтобы избежать возможных ошибок
-        password: await hashPassword(password),
-        role,
-        isBlocked: false,
-        createdAt: new Date().toISOString()
-    };
-    
-    users.push(newUser);
-    
-    const userResponse = { ...newUser };
-    delete userResponse.password;
-    
-    res.status(201).json(userResponse);
-});
-
-app.get('/api/menu', (req, res) => {
-    res.json(menuItems);
-});
-
-app.get('/api/menu/:id', (req, res) => {
-    const id = parseInt(req.params.id)
-    const item = menuItems.find(i => i.id == id);
-    if (!item) {
-        return res.status(404).json({ error: 'Блюдо не найдено' });
-    }
-    
-    const response = { ...item };
-    const user = users.find(u => u.id === req.user.id);
-    if (user.role !== ROLES.CHEF && user.role !== ROLES.ADMIN) {
-        delete response.recipe;
-    }
-    
     res.json(response);
-});
+  });
 
-app.post('/api/menu', authenticateToken, authorize(ROLES.ADMIN), (req, res) => {
+  app.post('/api/menu', authenticateToken, authorize(ROLES.ADMIN), async (req, res) => {
     const { name, price, category, weight, description, image, recipe, cookingTime, ingredients } = req.body;
-    
+
     if (!name || !price || !category || !weight) {
-        return res.status(400).json({ error: "Название, цена, категория и вес блюда обязательны" });
+      return res.status(400).json({ error: 'Название, цена, категория и вес блюда обязательны' });
     }
-    
-    const newItem = {
-        id: Date.now(),
+
+    const nextId = await pool.query('SELECT COALESCE(MAX(id), 0) + 1 AS id FROM menu_items');
+
+    const created = await pool.query(
+      `INSERT INTO menu_items
+        (id, name, price, category, weight, description, image, recipe, cooking_time, ingredients)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+       RETURNING id, name, price::float AS price, category, weight, description, image,
+                 recipe, cooking_time AS "cookingTime", ingredients`,
+      [
+        nextId.rows[0].id,
         name,
-        price: Number(price),
+        Number(price),
         category,
-        weight: weight || '',
-        description: description || '',
-        image: image || '/images/default.jpg',
-        recipe: recipe || '',
-        cookingTime: cookingTime || '15 минут',
-        ingredients: ingredients || 'Ингредиенты не указаны'
-    };
-    
-    menuItems.push(newItem);
-    res.status(201).json(newItem);
-});
+        weight,
+        description || '',
+        image || '/images/default.jpg',
+        recipe || '',
+        cookingTime || '15 минут',
+        ingredients || 'Ингредиенты не указаны',
+      ],
+    );
 
-app.put('/api/menu/:id', authenticateToken, authorize(ROLES.ADMIN), (req, res) => {
-    const id = parseInt(req.params.id)
-    const itemIndex = menuItems.findIndex(i => i.id == id);
-    if (itemIndex === -1) {
-        return res.status(404).json({ error: 'Блюдо не найдено' });
-    }
-    menuItems[itemIndex] = {
-        ...menuItems[itemIndex],
-        ...req.body,
-        id: menuItems[itemIndex].id,
-        price: req.body.price !== undefined ? Number(req.body.price) : menuItems[itemIndex].price
-    };
+    res.status(201).json(created.rows[0]);
+  });
 
-    res.json(menuItems[itemIndex]);
-});
+  app.put('/api/menu/:id', authenticateToken, authorize(ROLES.ADMIN), async (req, res) => {
+    const id = Number(req.params.id);
+    const existing = await pool.query('SELECT id, price FROM menu_items WHERE id = $1', [id]);
+    if (!existing.rows[0]) return res.status(404).json({ error: 'Блюдо не найдено' });
 
-app.delete('/api/menu/:id', authenticateToken, authorize(ROLES.ADMIN), (req, res) => {
-    const id = parseInt(req.params.id)
-    const itemToDelete = menuItems.find(item => item.id === id);
-    
-    if (!itemToDelete) {
-        return res.status(404).json({ error: 'Блюдо не найдено' });
-    }
-    
-    menuItems = menuItems.filter(item => item.id !== id);
-    
-    res.json({ 
-        message: 'Блюдо удалено', 
-        deletedItem: itemToDelete,
-        remainingCount: menuItems.length
+    const body = req.body || {};
+    const updated = await pool.query(
+      `UPDATE menu_items
+       SET name = COALESCE($2, name),
+           price = COALESCE($3, price),
+           category = COALESCE($4, category),
+           weight = COALESCE($5, weight),
+           description = COALESCE($6, description),
+           image = COALESCE($7, image),
+           recipe = COALESCE($8, recipe),
+           cooking_time = COALESCE($9, cooking_time),
+           ingredients = COALESCE($10, ingredients)
+       WHERE id = $1
+       RETURNING id, name, price::float AS price, category, weight, description, image,
+                 recipe, cooking_time AS "cookingTime", ingredients`,
+      [
+        id,
+        body.name || null,
+        body.price === undefined ? null : Number(body.price),
+        body.category || null,
+        body.weight || null,
+        body.description || null,
+        body.image || null,
+        body.recipe || null,
+        body.cookingTime || null,
+        body.ingredients || null,
+      ],
+    );
+
+    res.json(updated.rows[0]);
+  });
+
+  app.delete('/api/menu/:id', authenticateToken, authorize(ROLES.ADMIN), async (req, res) => {
+    const id = Number(req.params.id);
+
+    const deleted = await pool.query(
+      `DELETE FROM menu_items
+       WHERE id = $1
+       RETURNING id, name, price::float AS price, category, weight, description, image,
+                 recipe, cooking_time AS "cookingTime", ingredients`,
+      [id],
+    );
+
+    if (!deleted.rows[0]) return res.status(404).json({ error: 'Блюдо не найдено' });
+
+    const count = await pool.query('SELECT COUNT(*)::int AS count FROM menu_items');
+
+    return res.json({
+      message: 'Блюдо удалено',
+      deletedItem: deleted.rows[0],
+      remainingCount: count.rows[0].count,
     });
-});
+  });
 
-app.get('/api/tables', authenticateToken, (req, res) => {
-    res.json(tables);
-});
+  app.get('/api/tables', authenticateToken, async (_req, res) => {
+    const tables = await getTablesWithSlots();
+    return res.json(tables);
+  });
 
-app.post('/api/tables/:id/book', authenticateToken, authorize(ROLES.CLIENT, ROLES.WAITER, ROLES.CHEF ,ROLES.ADMIN), (req, res) => {
-    const tableId = parseInt(req.params.id);
+  app.post('/api/tables/:id/book', authenticateToken, authorize(ROLES.CLIENT, ROLES.WAITER, ROLES.CHEF, ROLES.ADMIN), async (req, res) => {
+    const tableId = Number(req.params.id);
     const { timeSlot } = req.body;
-    
-    if (!timeSlot) {
-        return res.status(400).json({ error: "Время бронирования обязательно" });
-    }
-    
-    const table = tables.find(t => t.id === tableId);
-    if (!table) {
-        return res.status(404).json({ error: "Стол не найден" });
-    }
-    
-    if (table.status === 'booked') {
-        return res.status(400).json({ error: "Стол полностью занят на сегодня" });
-    }
-    
-    const newSlot = parseTimeSlot(timeSlot);
-    if (!newSlot) {
-        return res.status(400).json({ error: "Неверный формат времени. Используйте HH:MM-HH:MM" });
-    }
-    
-    if (newSlot.end - newSlot.start < 30) {
-        return res.status(400).json({ error: "Минимальное время бронирования 30 минут" });
-    }
 
-    if (newSlot.start < 9 * 60 || newSlot.end > 23 * 60) {
-        return res.status(400).json({ error: "Ресторан работает с 9:00 до 23:00" });
-    }
-    
-    const overlap = table.slots.some(existingSlot => {
-        const existing = parseTimeSlot(existingSlot);
-        if (!existing) return false;
-        return newSlot.start < existing.end && newSlot.end > existing.start;
-    });
-    
-    if (overlap) {
-        return res.status(400).json({ 
-            error: "Это время уже забронировано",
-            existingSlots: table.slots
+    if (!timeSlot) return res.status(400).json({ error: 'Время бронирования обязательно' });
+
+    const table = await pool.query('SELECT id FROM restaurant_tables WHERE id = $1', [tableId]);
+    if (!table.rows[0]) return res.status(404).json({ error: 'Стол не найден' });
+
+    const validationError = validateBookingTime(timeSlot);
+    if (validationError) return res.status(400).json({ error: validationError });
+
+    const bookingDates = toBookingDates(timeSlot);
+
+    try {
+      const result = await pool.query(
+        `INSERT INTO bookings (table_id, user_id, time_slot, booking_start, booking_end, status)
+         VALUES ($1, $2, $3, $4, $5, 'active')
+         RETURNING id`,
+        [
+          tableId,
+          req.user.id,
+          bookingDates.formattedSlot,
+          bookingDates.startDate.toISOString(),
+          bookingDates.endDate.toISOString(),
+        ],
+      );
+
+      const tables = await getTablesWithSlots();
+      const updatedTable = tables.find((item) => item.id === tableId);
+
+      return res.json({
+        message: 'Стол успешно забронирован',
+        table: updatedTable,
+        bookedSlot: bookingDates.formattedSlot,
+        bookingId: result.rows[0].id,
+      });
+    } catch (error) {
+      if (error.code === '23P01') {
+        const existing = await pool.query(
+          'SELECT time_slot FROM bookings WHERE table_id = $1 AND status = $2 ORDER BY booking_start',
+          [tableId, 'active'],
+        );
+        return res.status(400).json({
+          error: 'Это время уже забронировано',
+          existingSlots: existing.rows.map((row) => row.time_slot),
         });
+      }
+      throw error;
     }
-    
-    const formattedSlot = `${newSlot.startStr}-${newSlot.endStr}`;
-    table.slots.push(formattedSlot);
-    
-    if (table.slots.length >= 3) {
-        table.status = 'booked';
-    } else if (table.slots.length > 0) {
-        table.status = 'partial';
-    }
-    
-    res.json({ 
-        message: "Стол успешно забронирован", 
-        table,
-        bookedSlot: formattedSlot
-    });
-});
+  });
 
-app.post('/api/orders', authenticateToken, authorize(ROLES.CLIENT, ROLES.CHEF, ROLES.WAITER, ROLES.ADMIN), (req, res) => {
+  app.post('/api/orders', authenticateToken, authorize(ROLES.CLIENT, ROLES.CHEF, ROLES.WAITER, ROLES.ADMIN), async (req, res) => {
     const { tableId, timeSlot, dishes, clientName } = req.body;
-    
-    if (!tableId || !timeSlot || !dishes || dishes.length === 0) {
-        return res.status(400).json({ error: "Необходимо указать стол, время и блюда" });
-    }
-    
-    const table = tables.find(t => t.id === tableId);
-    if (!table) {
-        return res.status(404).json({ error: "Стол не найден" });
+
+    if (!tableId || !timeSlot || !Array.isArray(dishes) || dishes.length === 0) {
+      return res.status(400).json({ error: 'Необходимо указать стол, время и блюда' });
     }
 
-    const orderSlot = parseTimeSlot(timeSlot);
-    if (!orderSlot) {
-        return res.status(400).json({ error: "Неверный формат времени" });
-    }
-    
-    const isBooked = table.slots.some(existingSlot => {
-        const existing = parseTimeSlot(existingSlot);
-        if (!existing) return false;
-        return orderSlot.start < existing.end && orderSlot.end > existing.start;
-    });
-    
-    if (!isBooked) {
-        return res.status(400).json({ error: "Стол не забронирован на это время. Сначала забронируйте стол!" });
-    }
-    
-    const user = users.find(u => u.id === req.user.id);
-    
-    const newOrder = {
-        id: `ord-${Date.now()}`,
-        tableId,
-        timeSlot,
-        sortMinutes: orderSlot.start,
-        dishes: dishes.map(d => ({
-            name: d.name,
-            total: d.quantity,
-            remaining: d.quantity,
-            dishId: d.dishId,
-            comment: d.comment || '',
-            status: 'pending'
-        })),
-        completed: false,
-        createdAt: new Date().toISOString(),
-        clientId: user.id,
-        clientName: clientName || user.name,
-        status: 'active'
-    };
-    
-    orders.push(newOrder);
-    updateDishQueue();
-    
-    res.status(201).json(newOrder);
-});
+    const validationError = validateBookingTime(timeSlot);
+    if (validationError) return res.status(400).json({ error: validationError });
 
-app.get('/api/orders', authenticateToken, authorize(ROLES.CLIENT,ROLES.ADMIN, ROLES.WAITER, ROLES.CHEF), (req, res) => {
-    res.json(orders);
-});
+    const bookingDates = toBookingDates(timeSlot);
 
-app.get('/api/orders/my', authenticateToken, authorize(ROLES.CLIENT), (req, res) => {
-    const userOrders = orders.filter(o => o.clientId === req.user.id);
-    res.json(userOrders);
-});
+    const tableResult = await pool.query('SELECT id FROM restaurant_tables WHERE id = $1', [Number(tableId)]);
+    if (!tableResult.rows[0]) return res.status(404).json({ error: 'Стол не найден' });
 
-app.put('/api/orders/:orderId/dish/:dishIndex/serve', authenticateToken, authorize(ROLES.WAITER, ROLES.ADMIN), (req, res) => {
-    const { orderId, dishIndex } = req.params;
-    
-    const order = orders.find(o => o.id === orderId);
-    if (!order) {
-        return res.status(404).json({ error: "Заказ не найден" });
-    }
-    
-    const dish = order.dishes[parseInt(dishIndex)];
-    if (!dish) {
-        return res.status(404).json({ error: "Блюдо не найдено" });
+    const bookingResult = await pool.query(
+      `SELECT id
+       FROM bookings
+       WHERE table_id = $1
+         AND status = 'active'
+         AND booking_start <= $2
+         AND booking_end >= $3
+       ORDER BY booking_start ASC
+       LIMIT 1`,
+      [Number(tableId), bookingDates.startDate.toISOString(), bookingDates.endDate.toISOString()],
+    );
+
+    const booking = bookingResult.rows[0];
+    if (!booking) {
+      return res.status(400).json({ error: 'Стол не забронирован на это время. Сначала забронируйте стол!' });
     }
 
-    if (dish.status !== 'ready') {
-        return res.status(400).json({ error: "Блюдо еще не готово к подаче" });
-    }
-    
-    if (dish.remaining > 0) {
-        dish.remaining--;
+    const dishIds = dishes.map((dish) => Number(dish.dishId));
+    const menuRows = await pool.query(
+      `SELECT id, name
+       FROM menu_items
+       WHERE id = ANY($1::int[])`,
+      [dishIds],
+    );
+    const menuMap = new Map(menuRows.rows.map((row) => [row.id, row]));
+
+    for (const dish of dishes) {
+      if (!menuMap.has(Number(dish.dishId))) {
+        return res.status(400).json({ error: `Блюдо с id ${dish.dishId} не найдено` });
+      }
+      if (!dish.quantity || Number(dish.quantity) <= 0) {
+        return res.status(400).json({ error: 'Количество блюда должно быть больше 0' });
+      }
     }
 
-    if (dish.remaining === 0) {
-        dish.status = 'served';
-    }
-    
-    const allServed = order.dishes.every(d => d.remaining === 0);
-    if (allServed) {
-        order.completed = true;
-        order.status = 'completed';
-    }
-    
-    updateDishQueue();
-    res.json(order);
-});
+    const orderId = `ord-${Date.now()}-${nanoid(6)}`;
+    const client = await pool.connect();
 
-app.get('/api/kitchen/queue', authenticateToken, authorize(ROLES.CHEF, ROLES.ADMIN), (req, res) => {
-    updateDishQueue();
-    res.json(dishQueue);
-});
+    try {
+      await client.query('BEGIN');
 
-app.put('/api/kitchen/dish/:queueId/start', authenticateToken, authorize(ROLES.CHEF, ROLES.ADMIN), (req, res) => {
-    const { queueId } = req.params;
-    const lastDashIndex = queueId.lastIndexOf('-');
-    const orderId = queueId.substring(0, lastDashIndex);
-    const dishIndex = parseInt(queueId.substring(lastDashIndex + 1));       
-    const order = orders.find(o => o.id === orderId);
+      await client.query(
+        `INSERT INTO orders
+          (id, table_id, booking_id, client_id, client_name, time_slot, sort_minutes, status, completed)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,'active',FALSE)`,
+        [
+          orderId,
+          Number(tableId),
+          booking.id,
+          req.user.id,
+          clientName || req.user.name,
+          bookingDates.formattedSlot,
+          bookingDates.parsed.start,
+        ],
+      );
 
-    if (!order) {
-        return res.status(404).json({ error: "Заказ не найден" });
+      for (const dish of dishes) {
+        const menuDish = menuMap.get(Number(dish.dishId));
+        await client.query(
+          `INSERT INTO order_items
+            (order_id, dish_id, dish_name, total, remaining, status, comment)
+           VALUES ($1,$2,$3,$4,$4,'pending',$5)`,
+          [orderId, Number(dish.dishId), dish.name || menuDish.name, Number(dish.quantity), dish.comment || ''],
+        );
+      }
+
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
     }
-    
+
+    const orders = await fetchOrders();
+    const createdOrder = orders.find((order) => order.id === orderId);
+    return res.status(201).json(createdOrder);
+  });
+
+  app.get('/api/orders', authenticateToken, authorize(ROLES.CLIENT, ROLES.ADMIN, ROLES.WAITER, ROLES.CHEF), async (_req, res) => {
+    const orders = await fetchOrders();
+    return res.json(orders);
+  });
+
+  app.get('/api/orders/my', authenticateToken, authorize(ROLES.CLIENT), async (req, res) => {
+    const orders = await fetchOrders();
+    return res.json(orders.filter((order) => order.clientId === req.user.id));
+  });
+
+  app.put('/api/orders/:orderId/dish/:dishIndex/serve', authenticateToken, authorize(ROLES.WAITER, ROLES.ADMIN), async (req, res) => {
+    const { orderId } = req.params;
+    const dishIndex = Number(req.params.dishIndex);
+
+    const orders = await fetchOrders();
+    const order = orders.find((item) => item.id === orderId);
+    if (!order) return res.status(404).json({ error: 'Заказ не найден' });
+
     const dish = order.dishes[dishIndex];
-    if (!dish) {
-        return res.status(404).json({ error: "Блюдо не найдено" });
-    }
-    
-    if (dish.status !== 'pending') {
-        return res.status(400).json({ error: `Блюдо уже ${dish.status === 'cooking' ? 'готовится' : 'готово'}` });
-    }
-    
-    dish.status = 'cooking';
-    updateDishQueue();
-    
-    res.json({ message: "Блюдо начали готовить", dish });
-});
+    if (!dish) return res.status(404).json({ error: 'Блюдо не найдено' });
+    if (dish.status !== 'ready') return res.status(400).json({ error: 'Блюдо еще не готово к подаче' });
 
-app.put('/api/kitchen/dish/:queueId/complete', authenticateToken, authorize(ROLES.CHEF, ROLES.ADMIN), (req, res) => {
+    const nextRemaining = Math.max(0, dish.remaining - 1);
+    const nextStatus = nextRemaining === 0 ? 'served' : dish.status;
+
+    await pool.query('UPDATE order_items SET remaining = $2, status = $3 WHERE id = $1', [dish.itemId, nextRemaining, nextStatus]);
+
+    const refreshed = await fetchOrders();
+    const updatedOrder = refreshed.find((item) => item.id === orderId);
+
+    if (updatedOrder && isOrderCompleted(updatedOrder.dishes)) {
+      await pool.query("UPDATE orders SET completed = TRUE, status = 'completed' WHERE id = $1", [orderId]);
+    }
+
+    const latest = await fetchOrders();
+    const finalOrder = latest.find((item) => item.id === orderId);
+    return res.json(finalOrder);
+  });
+
+  app.get('/api/kitchen/queue', authenticateToken, authorize(ROLES.CHEF, ROLES.ADMIN), async (_req, res) => {
+    const result = await pool.query(
+      `SELECT o.id AS order_id,
+              o.table_id,
+              o.time_slot,
+              oi.id AS item_id,
+              oi.dish_name,
+              oi.dish_id,
+              oi.remaining,
+              oi.comment,
+              oi.status
+       FROM orders o
+       JOIN order_items oi ON oi.order_id = o.id
+       WHERE o.completed = FALSE
+         AND oi.remaining > 0
+       ORDER BY o.created_at, oi.id`,
+    );
+
+    const queue = result.rows.map((row) => ({
+      id: `${row.order_id}-${row.item_id}`,
+      orderId: row.order_id,
+      tableId: row.table_id,
+      dishName: row.dish_name,
+      dishId: row.dish_id,
+      quantity: row.remaining,
+      comment: row.comment,
+      status: row.status,
+      timeSlot: row.time_slot,
+    }));
+
+    return res.json(queue);
+  });
+
+  app.put('/api/kitchen/dish/:queueId/start', authenticateToken, authorize(ROLES.CHEF, ROLES.ADMIN), async (req, res) => {
     const { queueId } = req.params;
-    const lastDashIndex = queueId.lastIndexOf('-');
-    const orderId = queueId.substring(0, lastDashIndex);
-    const dishIndex = parseInt(queueId.substring(lastDashIndex + 1));
-    const order = orders.find(o => o.id === orderId);
-    
-    if (!order) {
-        return res.status(404).json({ error: "Заказ не найден" });
-    }
-    
-    const dish = order.dishes[dishIndex];
-    if (!dish) {
-        return res.status(404).json({ error: "Блюдо не найдено" });
-    }
-    
-    if (dish.status !== 'cooking') {
-        return res.status(400).json({ error: "Блюдо не начали готовить" });
-    }
-    
-    dish.status = 'ready';
-    updateDishQueue();
-    
-    res.json({ 
-        message: "Блюдо готово к подаче", 
-        dish,
-        remaining: dish.remaining,
-        status: dish.status
-    });
-});
+    const splitIndex = queueId.lastIndexOf('-');
+    const orderId = queueId.slice(0, splitIndex);
+    const itemId = Number(queueId.slice(splitIndex + 1));
 
-app.get('/api/kitchen/recipe/:dishId', authenticateToken, authorize(ROLES.CHEF, ROLES.ADMIN), (req, res) => {
-    const dish = menuItems.find(d => d.id == req.params.dishId);
-    if (!dish) {
-        return res.status(404).json({ error: "Блюдо не найдено" });
+    const itemResult = await pool.query(
+      `SELECT oi.id, oi.status
+       FROM order_items oi
+       JOIN orders o ON o.id = oi.order_id
+       WHERE oi.id = $1 AND o.id = $2`,
+      [itemId, orderId],
+    );
+
+    const item = itemResult.rows[0];
+    if (!item) return res.status(404).json({ error: 'Блюдо не найдено' });
+    if (item.status !== 'pending') {
+      return res.status(400).json({ error: `Блюдо уже ${item.status === 'cooking' ? 'готовится' : 'готово'}` });
     }
-    const comments = [];
-    const activeOrders = orders.filter(o => !o.completed);
-    activeOrders.forEach(order => {
-        order.dishes.forEach(dishItem => {
-            if (dishItem.dishId == req.params.dishId && dishItem.comment) {
-                comments.push({
-                    orderId: order.id,
-                    tableId: order.tableId,
-                    comment: dishItem.comment,
-                    timeSlot: order.timeSlot
-                });
-            }
-        });
-    });
-    
-    res.json({
-        id: dish.id,
-        name: dish.name,
-        recipe: dish.recipe || "Рецепт не добавлен",
-        description: dish.description,
-        cookingTime: dish.cookingTime || "15-20 минут",
-        ingredients: dish.ingredients || "Ингредиенты не указаны",
-        comments: comments
-    });
-});
 
-app.get('/api/admin/stats', authenticateToken, authorize(ROLES.ADMIN), (req, res) => {
-    const activeOrders = orders.filter(o => !o.completed);
-    const completedOrders = orders.filter(o => o.completed);
-    
-    const totalRevenue = completedOrders.reduce((sum, order) => {
-        const orderTotal = order.dishes.reduce((dishSum, dish) => {
-            const menuItem = menuItems.find(m => m.name === dish.name);
-            return dishSum + (menuItem ? menuItem.price * dish.total : 0);
-        }, 0);
-        return sum + orderTotal;
-    }, 0);
-    
-    res.json({
-        totalOrders: orders.length,
-        activeOrders: activeOrders.length,
-        completedOrders: completedOrders.length,
-        totalRevenue,
-        tablesCount: tables.length,
-        bookedTables: tables.filter(t => t.status === 'booked').length,
-        partialTables: tables.filter(t => t.status === 'partial').length,
-        freeTables: tables.filter(t => t.status === 'free').length,
-        menuItemsCount: menuItems.length,
-        usersCount: users.length
-    });
-});
+    await pool.query("UPDATE order_items SET status = 'cooking' WHERE id = $1", [itemId]);
 
-app.use((req, res, next) => {
+    const updated = await pool.query('SELECT id, dish_name AS name, remaining, status FROM order_items WHERE id = $1', [itemId]);
+    return res.json({ message: 'Блюдо начали готовить', dish: updated.rows[0] });
+  });
+
+  app.put('/api/kitchen/dish/:queueId/complete', authenticateToken, authorize(ROLES.CHEF, ROLES.ADMIN), async (req, res) => {
+    const { queueId } = req.params;
+    const splitIndex = queueId.lastIndexOf('-');
+    const orderId = queueId.slice(0, splitIndex);
+    const itemId = Number(queueId.slice(splitIndex + 1));
+
+    const itemResult = await pool.query(
+      `SELECT oi.id, oi.status
+       FROM order_items oi
+       JOIN orders o ON o.id = oi.order_id
+       WHERE oi.id = $1 AND o.id = $2`,
+      [itemId, orderId],
+    );
+
+    const item = itemResult.rows[0];
+    if (!item) return res.status(404).json({ error: 'Блюдо не найдено' });
+    if (item.status !== 'cooking') return res.status(400).json({ error: 'Блюдо не начали готовить' });
+
+    await pool.query("UPDATE order_items SET status = 'ready' WHERE id = $1", [itemId]);
+
+    const updated = await pool.query(
+      `SELECT id, dish_name AS name, remaining, status
+       FROM order_items
+       WHERE id = $1`,
+      [itemId],
+    );
+
+    return res.json({
+      message: 'Блюдо готово к подаче',
+      dish: updated.rows[0],
+      remaining: updated.rows[0].remaining,
+      status: updated.rows[0].status,
+    });
+  });
+
+  app.get('/api/kitchen/recipe/:dishId', authenticateToken, authorize(ROLES.CHEF, ROLES.ADMIN), async (req, res) => {
+    const dishId = Number(req.params.dishId);
+
+    const dishResult = await pool.query(
+      `SELECT id, name, recipe, description, cooking_time AS "cookingTime", ingredients
+       FROM menu_items
+       WHERE id = $1`,
+      [dishId],
+    );
+
+    const dish = dishResult.rows[0];
+    if (!dish) return res.status(404).json({ error: 'Блюдо не найдено' });
+
+    const commentsResult = await pool.query(
+      `SELECT o.id AS order_id, o.table_id, o.time_slot, oi.comment
+       FROM orders o
+       JOIN order_items oi ON oi.order_id = o.id
+       WHERE o.completed = FALSE
+         AND oi.dish_id = $1
+         AND oi.comment <> ''`,
+      [dishId],
+    );
+
+    return res.json({
+      id: dish.id,
+      name: dish.name,
+      recipe: dish.recipe || 'Рецепт не добавлен',
+      description: dish.description,
+      cookingTime: dish.cookingTime || '15-20 минут',
+      ingredients: dish.ingredients || 'Ингредиенты не указаны',
+      comments: commentsResult.rows.map((row) => ({
+        orderId: row.order_id,
+        tableId: row.table_id,
+        comment: row.comment,
+        timeSlot: row.time_slot,
+      })),
+    });
+  });
+
+  app.get('/api/admin/stats', authenticateToken, authorize(ROLES.ADMIN), async (_req, res) => {
+    const [ordersResult, menuResult, tables] = await Promise.all([
+      fetchOrders(),
+      pool.query('SELECT id, price::float AS price FROM menu_items'),
+      getTablesWithSlots(),
+    ]);
+
+    const menuById = new Map(menuResult.rows.map((row) => [row.id, row]));
+
+    const completedOrders = ordersResult.filter((order) => order.completed);
+    const activeOrders = ordersResult.filter((order) => !order.completed);
+
+    const totalRevenue = completedOrders.reduce((sum, order) => sum + calculateOrderTotal(order.dishes, menuById), 0);
+
+    const usersCountResult = await pool.query('SELECT COUNT(*)::int AS count FROM users');
+
+    return res.json({
+      totalOrders: ordersResult.length,
+      activeOrders: activeOrders.length,
+      completedOrders: completedOrders.length,
+      totalRevenue,
+      tablesCount: tables.length,
+      bookedTables: tables.filter((t) => t.status === 'booked').length,
+      partialTables: tables.filter((t) => t.status === 'partial').length,
+      freeTables: tables.filter((t) => t.status === 'free').length,
+      menuItemsCount: menuById.size,
+      usersCount: usersCountResult.rows[0].count,
+    });
+  });
+
+  app.use((req, res, next) => {
     res.on('finish', () => {
-        console.log(`[${new Date().toISOString()}] [${req.method}] ${res.statusCode} ${req.path}`);
+      console.log(`[${new Date().toISOString()}] [${req.method}] ${res.statusCode} ${req.path}`);
     });
     next();
-});
+  });
 
-app.listen(port, () => {
-    console.log(`Сервер запущен на http://localhost:${port}`);
-});
+  const distPath = path.join(__dirname, 'dist');
+  app.use('/TableOne', express.static(distPath));
+  app.get('/TableOne/*', (_req, res) => {
+    res.sendFile(path.join(distPath, 'index.html'));
+  });
+
+  app.use((error, _req, res, _next) => {
+    console.error(error);
+    res.status(500).json({ error: 'Внутренняя ошибка сервера' });
+  });
+
+  return app;
+}
+
+const app = createApp();
+let server;
+
+async function startServer() {
+  if (config.autoMigrate) await migrate();
+  if (config.autoSeed) await seedDatabase();
+
+  return new Promise((resolve) => {
+    server = app.listen(config.port, () => {
+      console.log(`Сервер запущен на http://localhost:${config.port}`);
+      resolve(server);
+    });
+  });
+}
+
+async function shutdown() {
+  if (server) {
+    await new Promise((resolve, reject) => {
+      server.close((error) => (error ? reject(error) : resolve()));
+    });
+  }
+  await pool.end();
+}
+
+if (require.main === module) {
+  startServer();
+
+  const stopSignals = ['SIGINT', 'SIGTERM'];
+  stopSignals.forEach((signal) => {
+    process.on(signal, async () => {
+      await shutdown();
+      process.exit(0);
+    });
+  });
+}
+
+module.exports = {
+  app,
+  createApp,
+  startServer,
+  shutdown,
+  ROLES,
+  validateBookingTime,
+};
